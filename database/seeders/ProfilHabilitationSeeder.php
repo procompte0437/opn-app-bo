@@ -299,35 +299,8 @@ class ProfilHabilitationSeeder extends Seeder
             }
         }
 
-        /* Droits métier sur la chaîne d'approvisionnement (gestion des commandes). */
-        $flux = $all['flux'] ?? null;
-        if ($flux) {
-            // Demandeur : crée et consulte uniquement.
-            foreach (['demandeur', 'demandeur_structure'] as $codeDemandeur) {
-                if (isset($ids[$codeDemandeur])) {
-                    $this->grant($ids[$codeDemandeur], $flux, ['creer' => true, 'lire' => true]);
-                }
-            }
-            // Antenne : prend en charge (modifier) et peut aussi commander.
-            foreach (['chef_antenne', 'pharmacien_antenne'] as $codeAntenne) {
-                if (isset($ids[$codeAntenne])) {
-                    $this->grant($ids[$codeAntenne], $flux, [
-                        'creer' => true,
-                        'lire' => true,
-                        'modifier' => true,
-                    ]);
-                }
-            }
-            // Siège : disperse (valider).
-            foreach (['appro_national', 'collaborateur_appro', 'dg', 'dir', 'daf', 'achats', 'pharmacien_national'] as $codeSiege) {
-                if (isset($ids[$codeSiege])) {
-                    $this->grant($ids[$codeSiege], $flux, [
-                        'lire' => true,
-                        'valider' => true,
-                    ]);
-                }
-            }
-        }
+        /* Droits métier sur la chaîne d'approvisionnement (toujours réappliqués). */
+        $this->assurerDroitsFluxMetier($ids, $all);
 
         $this->rattacherSansProfil($ids);
         $this->retirerReferentielDemandeurs($ids);
@@ -440,6 +413,37 @@ class ProfilHabilitationSeeder extends Seeder
             'role' => 'Admin métier',
             'name' => 'Admin Métier',
         ]);
+    }
+
+    /** Crée / corrige les flags métier du flux, même si le profil a déjà des ACCESS_*. */
+    private function assurerDroitsFluxMetier(array $ids, $all): void
+    {
+        $flux = $all['flux'] ?? null;
+        if (!$flux) {
+            return;
+        }
+        foreach (['demandeur', 'demandeur_structure'] as $codeDemandeur) {
+            if (isset($ids[$codeDemandeur])) {
+                $this->grant($ids[$codeDemandeur], $flux, ['creer' => true, 'lire' => true]);
+            }
+        }
+        foreach (['chef_antenne', 'pharmacien_antenne'] as $codeAntenne) {
+            if (isset($ids[$codeAntenne])) {
+                $this->grant($ids[$codeAntenne], $flux, [
+                    'creer' => true,
+                    'lire' => true,
+                    'modifier' => true,
+                ]);
+            }
+        }
+        foreach (['appro_national', 'collaborateur_appro', 'dg', 'dir', 'daf', 'achats', 'pharmacien_national'] as $codeSiege) {
+            if (isset($ids[$codeSiege])) {
+                $this->grant($ids[$codeSiege], $flux, [
+                    'lire' => true,
+                    'valider' => true,
+                ]);
+            }
+        }
     }
 
     private function grant(int $profilId, int $habilitationId, array $flags): void

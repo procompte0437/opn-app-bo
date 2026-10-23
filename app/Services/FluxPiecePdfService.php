@@ -38,17 +38,9 @@ class FluxPiecePdfService
         $dompdf->setPaper('A4', 'portrait');
         $dompdf->setCallbacks([
             [
-                'event' => 'end_document',
-                'f' => function (int $pageNumber, int $pageCount, $canvas, $fontMetrics) {
-                    $font = $fontMetrics->getFont('DejaVu Sans', 'bold');
-                    $canvas->set_opacity(0.22);
-                    $largeur = $canvas->get_width();
-                    $hauteur = $canvas->get_height();
-                    for ($y = 36; $y < $hauteur + 20; $y += 148) {
-                        for ($x = -24; $x < $largeur; $x += 188) {
-                            $canvas->text($x, $y, 'OPN', $font, 32, [0.055, 0.165, 0.310], 0, 1.2, -32);
-                        }
-                    }
+                'event' => 'begin_page_render',
+                'f' => function ($frame, $canvas, $fontMetrics) {
+                    self::dessinerFiligrane($canvas, $fontMetrics);
                 },
             ],
         ]);
@@ -59,5 +51,28 @@ class FluxPiecePdfService
             'Content-Disposition' => 'attachment; filename="' . $filename . '"',
             'Cache-Control' => 'private, max-age=0, must-revalidate',
         ]);
+    }
+
+    /** Filigrane gris derrière le texte : petit, serré, sur toute la page y compris les bords. */
+    private static function dessinerFiligrane($canvas, $fontMetrics): void
+    {
+        $font = $fontMetrics->getFont('DejaVu Sans', 'bold');
+        $largeur = $canvas->get_width();
+        $hauteur = $canvas->get_height();
+        $texte = str_repeat('OPN', 140);
+        $gris = [0.47, 0.47, 0.47];
+        $pas = 12;
+        $angle = -28.0;
+        $marge = max($largeur, $hauteur) * 2;
+        $canvas->save();
+        for ($y = -$marge, $i = 0; $y <= $hauteur + $marge; $y += $pas, $i++) {
+            $x = -$marge + (($i % 2) * 8);
+            $canvas->set_opacity(0.08);
+            $canvas->text($x + 0.6, $y + 0.6, $texte, $font, 8, $gris, 0.0, 0.04, $angle);
+            $canvas->set_opacity(0.14);
+            $canvas->text($x, $y, $texte, $font, 8, $gris, 0.0, 0.04, $angle);
+        }
+        $canvas->restore();
+        $canvas->set_opacity(1);
     }
 }
