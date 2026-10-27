@@ -20,6 +20,12 @@ class CommandeTerritoriale extends Model
         'partenaire_type',
         'statut',
         'motif',
+        'categorie',
+        'kit_medical',
+        'bc_global_id',
+        'date_livraison_prevue',
+        'prise_en_charge_antenne_at',
+        'prise_en_charge_antenne_par_nom',
         'montant_total_xaf',
         'transmise_at',
         'transmise_par_nom',
@@ -38,6 +44,8 @@ class CommandeTerritoriale extends Model
         'transmise_at' => 'datetime',
         'transferee_au_siege_at' => 'datetime',
         'prise_en_charge_siege_at' => 'datetime',
+        'prise_en_charge_antenne_at' => 'datetime',
+        'date_livraison_prevue' => 'date',
         'dispersee_at' => 'datetime',
     ];
 
@@ -75,5 +83,15 @@ class CommandeTerritoriale extends Model
     public function pieces(): HasMany
     {
         return $this->hasMany(FluxPieceCommerciale::class, 'commande_id')->orderByDesc('id');
+    }
+
+    public function bcGlobal(): BelongsTo
+    {
+        return $this->belongsTo(FluxBcGlobal::class, 'bc_global_id');
+    }
+
+    public function bonsLivraison(): HasMany
+    {
+        return $this->hasMany(FluxBonLivraison::class, 'commande_id')->orderByDesc('id');
     }
 }

@@ -413,6 +413,71 @@ class AuthController extends Controller
         ]);
     }
 
+    /**
+     * Liste publique des comptes actifs pour le modal de connexion (profils depuis la BDD).
+     */
+    public function demoProfils(): JsonResponse
+    {
+        $users = User::query()
+            ->with(['profil:id,code,libelle', 'antenne:id,nom,chef_lieu,code_antenne,province_id', 'provinceRattachement:id,nom,code'])
+            ->where(function ($q) {
+                $q->whereNull('etat')->orWhere('etat', 'actif');
+            })
+            ->orderBy('name')
+            ->get();
+
+        $profils = $users->map(function (User $user) {
+            $nom = $user->name ?: ($user->email ?: 'Utilisateur');
+            $role = $user->profil?->libelle ?: ($user->role ?: 'Agent OPN');
+            $codeRole = $user->code_role ?: 'DEMANDEUR_STRUCTURE';
+            $provinceNom = $user->provinceRattachement?->nom
+                ?: $user->antenne?->nom
+                ?: null;
+            $provinceCode = $user->provinceRattachement?->code
+                ?: (is_string($user->antenne?->code_antenne) ? substr($user->antenne->code_antenne, 0, 2) : null);
+            $antenneNom = $user->antenne?->nom;
+
+            return [
+                'id' => $user->matricule_opn ?: ('USER-'.$user->id),
+                'user_id' => $user->id,
+                'nom' => $nom,
+                'name' => $nom,
+                'email' => $user->email,
+                'role' => $role,
+                'codeRole' => $codeRole,
+                'code_role' => $codeRole,
+                'profil_code' => $user->profil?->code,
+                'profil' => $user->profil?->libelle,
+                'provinceId' => $provinceCode,
+                'province_nom' => $provinceNom,
+                'antenne' => $antenneNom,
+                'antenne_id' => $user->antenne_id,
+                'province_id' => $user->province_id,
+                'initiales' => $this->initialesDepuisNom($nom),
+            ];
+        })->values();
+
+        return response()->json([
+            'success' => true,
+            'profils' => $profils,
+            'count' => $profils->count(),
+        ]);
+    }
+
+    private function initialesDepuisNom(string $nom): string
+    {
+        $parts = preg_split('/\s+/', trim(preg_replace('/^(Ing\.|Dr\.|Mme|M\.|Capitaine|Inspecteur)\s+/iu', '', $nom) ?: $nom));
+        $parts = array_values(array_filter($parts ?: []));
+        if (count($parts) >= 2) {
+            return strtoupper(mb_substr($parts[0], 0, 1).mb_substr($parts[count($parts) - 1], 0, 1));
+        }
+        if (count($parts) === 1) {
+            return strtoupper(mb_substr($parts[0], 0, 2));
+        }
+
+        return 'OPN';
+    }
+
     public function me(Request $request): JsonResponse
     {
         $user = $request->user();

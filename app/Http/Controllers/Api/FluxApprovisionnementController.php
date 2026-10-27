@@ -15,6 +15,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class FluxApprovisionnementController extends Controller
 {
@@ -69,6 +70,11 @@ class FluxApprovisionnementController extends Controller
             $payload['groupees'] = $this->grouperPourSiege($commandes);
         }
 
+        // Chef d'antenne : demandes organisées par demandeur.
+        if ($stage === 'antenne') {
+            $payload['par_demandeurs'] = $this->grouperParDemandeurs($commandes);
+        }
+
         return response()->json($payload);
     }
 
@@ -84,9 +90,14 @@ class FluxApprovisionnementController extends Controller
             'partenaire_nom' => 'required|string|max:200',
             'partenaire_type' => 'nullable|string|max:40',
             'motif' => 'nullable|string|max:1000',
+            'categorie' => 'nullable|string|max:120',
+            'kit_medical' => 'nullable|string|max:120',
+            'brouillon' => 'nullable|boolean',
+            'date_livraison_prevue' => 'nullable|date',
             'lignes' => 'required|array|min:1',
             'lignes.*.produit_id' => 'nullable|exists:produits_pharmaceutiques,id',
             'lignes.*.designation' => 'required|string|max:200',
+            'lignes.*.categorie' => 'nullable|string|max:120',
             'lignes.*.quantite_demandee' => 'required|integer|min:1',
         ]);
 
@@ -120,7 +131,7 @@ class FluxApprovisionnementController extends Controller
                 }
                 $montant += $prix * (int) $ligne['quantite_demandee'];
                 $qte = (int) $ligne['quantite_demandee'];
-                $lignes[] = [
+                $row = [
                     'produit_id' => $ligne['produit_id'] ?? null,
                     'designation' => $ligne['designation'],
                     'quantite_demandee' => $qte,
@@ -129,18 +140,32 @@ class FluxApprovisionnementController extends Controller
                     'quantite_dispersee' => 0,
                     'prix_unitaire_xaf' => $prix,
                 ];
+                if (Schema::hasColumn('lignes_commande_territoriale', 'categorie')) {
+                    $row['categorie'] = $ligne['categorie'] ?? ($data['categorie'] ?? null);
+                }
+                if (Schema::hasColumn('lignes_commande_territoriale', 'quantite_prise_antenne')) {
+                    $row['quantite_prise_antenne'] = 0;
+                }
+                $lignes[] = $row;
             }
 
             $creeeParChef = in_array($user->code_role, ['CHEF_ANTENNE_PROVINCIALE', 'PHARMACIEN_CHEF_ANTENNE'], true);
             $creeeParDg = $user->code_role === 'DG';
+            $estDemandeur = in_array($user->code_role, ['DEMANDEUR_PHARMACIEN', 'DEMANDEUR_STRUCTURE'], true);
             $now = now();
-            // Le bon du chef part tout de suite vers la Direction générale.
-            $statutInitial = $creeeParChef ? 'TRANSFEREE_SIEGE' : 'SOUMISE_ANTENNE';
+            // Demandeur : brouillon possible. Chef : part tout de suite vers la DG.
+            if ($creeeParChef) {
+                $statutInitial = 'TRANSFEREE_SIEGE';
+            } elseif ($estDemandeur && !empty($data['brouillon'])) {
+                $statutInitial = 'BROUILLON';
+            } else {
+                $statutInitial = 'SOUMISE_ANTENNE';
+            }
             // Chef : à son nom. Direction générale : identifiable comme telle, destinée à l'antenne choisie.
             $partenaireNom = $creeeParDg ? 'Direction générale' : ($creeeParChef ? $user->name : $data['partenaire_nom']);
             $partenaireType = $creeeParDg ? 'DIRECTION_GENERALE' : ($creeeParChef ? 'ANTENNE' : ($data['partenaire_type'] ?? 'PHARMACIE'));
 
-            $commande = CommandeTerritoriale::create([
+            $payload = [
                 'numero_commande' => 'CMD-'.now()->format('Ymd').'-'.str_pad((string) (CommandeTerritoriale::count() + 1), 4, '0', STR_PAD_LEFT),
                 'antenne_id' => $data['antenne_id'],
                 'demandeur_user_id' => $user->id,
@@ -156,7 +181,14 @@ class FluxApprovisionnementController extends Controller
                 'transferee_au_siege_par_nom' => $creeeParChef ? $user->name : null,
                 'transmise_at' => $creeeParChef ? $now : null,
                 'transmise_par_nom' => $creeeParChef ? $user->name : null,
-            ]);
+            ];
+            foreach (['categorie' => $data['categorie'] ?? null, 'kit_medical' => $data['kit_medical'] ?? null, 'date_livraison_prevue' => $data['date_livraison_prevue'] ?? null] as $col => $val) {
+                if (Schema::hasColumn('commandes_territoriales', $col)) {
+                    $payload[$col] = $val;
+                }
+            }
+
+            $commande = CommandeTerritoriale::create($payload);
             foreach ($lignes as $ligne) {
                 $commande->lignes()->create($ligne);
             }
@@ -875,12 +907,18 @@ class FluxApprovisionnementController extends Controller
         ]);
         $commande->setAttribute('initiee_par_antenne', ($commande->partenaire_type ?? '') === 'ANTENNE');
         $commande->setAttribute('initiee_par_direction_generale', ($commande->partenaire_type ?? '') === 'DIRECTION_GENERALE');
+        $priseAntenne = $lignes->sum(fn ($l) => (int) ($l->quantite_prise_antenne ?? 0));
         $commande->setAttribute('quantites', [
             'demandee' => $demande,
+            'prise_antenne' => $priseAntenne,
             'prise' => $prise,
             'reliquat' => $reliquat,
             'dispersee' => $dispersee,
         ]);
+        $commande->setAttribute('categorie', $commande->categorie);
+        $commande->setAttribute('kit_medical', $commande->kit_medical);
+        $commande->setAttribute('date_livraison_prevue', optional($commande->date_livraison_prevue)->format('Y-m-d'));
+        $commande->setAttribute('bc_global_id', $commande->bc_global_id);
 
         if ($commande->relationLoaded('pieces')) {
             $commande->setAttribute('bons_commande', $commande->pieces->where('type', FluxPieceCommerciale::TYPE_BC)->values());
@@ -927,7 +965,29 @@ class FluxApprovisionnementController extends Controller
     {
         return in_array($user->code_role, ['DEMANDEUR_PHARMACIEN', 'DEMANDEUR_STRUCTURE'], true)
             && (int) $commande->demandeur_user_id === (int) $user->id
-            && $commande->statut === 'SOUMISE_ANTENNE';
+            && in_array($commande->statut, ['BROUILLON', 'SOUMISE_ANTENNE'], true);
+    }
+
+    /** Regroupe les demandes antenne par demandeur (pharmacie / structure). */
+    private function grouperParDemandeurs($commandes): array
+    {
+        return $commandes
+            ->groupBy(fn ($c) => (string) ($c->demandeur_user_id ?: $c->demandeur_nom ?: 'n/a'))
+            ->map(function ($cmds) {
+                $first = $cmds->first();
+                return [
+                    'demandeur_user_id' => $first->demandeur_user_id,
+                    'demandeur_nom' => $first->demandeur_nom,
+                    'demandeur_role' => $first->demandeur_role,
+                    'partenaire_nom' => $first->partenaire_nom,
+                    'nb_commandes' => $cmds->count(),
+                    'a_transferer' => $cmds->whereIn('statut', ['SOUMISE_ANTENNE', 'EFFECTUEE_CHEF_ANTENNE', 'PARTIELLEMENT_ANTENNE'])->count(),
+                    'commandes' => $cmds->values(),
+                ];
+            })
+            ->sortBy('demandeur_nom')
+            ->values()
+            ->all();
     }
 
     /** La case Supprimer de l'habilitation flux autorise la suppression des commandes. */

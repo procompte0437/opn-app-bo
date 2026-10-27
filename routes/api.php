@@ -22,6 +22,7 @@ use App\Http\Controllers\Api\DirectionController;
 use App\Http\Controllers\Api\DirectionModuleController;
 use App\Http\Controllers\Api\NiveauAccesController;
 use App\Http\Controllers\Api\FluxApprovisionnementController;
+use App\Http\Controllers\Api\FluxCircuitController;
 use App\Http\Controllers\Api\PatrimoineController;
 use App\Http\Controllers\Api\OrganisationController;
 use App\Http\Controllers\Api\ReferentielController;
@@ -44,6 +45,7 @@ Route::prefix('v1')->group(function () {
     Route::post('/auth/verify-2fa', [AuthController::class, 'verify2fa'])->middleware('throttle:30,1');
     Route::post('/auth/confirm-totp', [AuthController::class, 'confirmTotp'])->middleware('throttle:30,1');
     Route::post('/auth/demo-quick', [AuthController::class, 'demoQuick'])->middleware('throttle:60,1');
+    Route::get('/auth/demo-profils', [AuthController::class, 'demoProfils'])->middleware('throttle:60,1');
     Route::post('/newsletter/subscribe', [NewsletterController::class, 'subscribe'])->middleware('throttle:10,1');
     Route::get('/site', [SitePublicController::class, 'index'])->middleware('throttle:60,1');
     Route::post('/helpdesk/password-reset-request', [HelpdeskController::class, 'requestPasswordReset'])->middleware('throttle:5,1');
@@ -165,6 +167,16 @@ Route::prefix('v1')->group(function () {
         Route::get('/flux/documents', [FluxApprovisionnementController::class, 'documents']);
         Route::get('/flux/documents/{id}/pdf', [FluxApprovisionnementController::class, 'documentPdf']);
         Route::get('/flux/documents/{id}', [FluxApprovisionnementController::class, 'document']);
+
+        /* Circuit MAJ : brouillon, stock antenne, BC global, BL signé */
+        Route::post('/flux/commandes/{id}/envoyer', [FluxCircuitController::class, 'envoyer']);
+        Route::post('/flux/commandes/{id}/prise-antenne', [FluxCircuitController::class, 'priseAntenne']);
+        Route::get('/flux/stock-antenne', [FluxCircuitController::class, 'stockAntenne']);
+        Route::get('/flux/categories', [FluxCircuitController::class, 'categoriesProduits']);
+        Route::get('/flux/bc-globaux', [FluxCircuitController::class, 'listerBcGlobaux']);
+        Route::post('/flux/bc-globaux', [FluxCircuitController::class, 'creerBcGlobal']);
+        Route::post('/flux/bc-globaux/{id}/transferer', [FluxCircuitController::class, 'transfererBcGlobal']);
+        Route::post('/flux/bons-livraison', [FluxCircuitController::class, 'genererBl']);
 
         Route::get('/parametrage/territoire', [ParametrageController::class, 'territoire']);
         Route::get('/parametrage/utilisateurs', [ParametrageController::class, 'utilisateurs']);

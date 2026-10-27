@@ -34,10 +34,41 @@ class ParametrageController extends Controller
     /** Provinces, antennes et directions proposées à la création d'un compte. */
     public function territoire(): JsonResponse
     {
+        $antennes = AntenneProvinciale::query()
+            ->with('province:id,nom,code')
+            ->orderBy('nom')
+            ->get(['id', 'code_antenne', 'nom', 'chef_lieu', 'ville_antenne', 'province_id']);
+
+        $provinces = Province::query()->orderBy('nom')->get(['id', 'nom', 'code']);
+
+        // Si la table provinces est vide, on reconstitue la liste depuis les antennes.
+        if ($provinces->isEmpty() && $antennes->isNotEmpty()) {
+            $provinces = $antennes
+                ->groupBy(fn ($a) => $a->province_id ?: ('ant:'.$a->id))
+                ->values()
+                ->map(function ($groupe, $index) {
+                    $first = $groupe->first();
+                    return [
+                        'id' => $first->province_id ?: (1000 + $index),
+                        'nom' => $first->province?->nom ?: $first->nom,
+                        'code' => $first->code_antenne ? substr((string) $first->code_antenne, 0, 8) : null,
+                        'synthetique' => empty($first->province_id),
+                    ];
+                })
+                ->values();
+        }
+
         return response()->json([
             'success' => true,
-            'provinces' => Province::query()->orderBy('nom')->get(['id', 'nom', 'code']),
-            'antennes' => AntenneProvinciale::query()->orderBy('nom')->get(['id', 'code_antenne', 'nom', 'chef_lieu', 'ville_antenne', 'province_id']),
+            'provinces' => $provinces,
+            'antennes' => $antennes->map(fn ($a) => [
+                'id' => $a->id,
+                'code_antenne' => $a->code_antenne,
+                'nom' => $a->nom,
+                'chef_lieu' => $a->chef_lieu,
+                'ville_antenne' => $a->ville_antenne,
+                'province_id' => $a->province_id,
+            ]),
             'directions' => Direction::query()->active()->ordered()->get(['id', 'nom', 'code', 'antenne_id']),
         ]);
     }

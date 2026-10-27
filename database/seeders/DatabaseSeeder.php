@@ -870,6 +870,7 @@ class DatabaseSeeder extends Seeder
 
         // 14. Chefs d'antenne + demandeurs pour les 9 provinces
         $this->call(ProvincesActeursSeeder::class);
+        $this->call(ProvincesDepuisAntennesSeeder::class);
 
         // 15. Contenu du site public (actualités, marchés, textes institutionnels)
         $this->call(SitePublicSeeder::class);
