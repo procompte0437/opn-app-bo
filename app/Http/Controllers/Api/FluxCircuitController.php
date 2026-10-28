@@ -119,6 +119,8 @@ class FluxCircuitController extends Controller
             'lignes.*.id' => 'required|integer',
             'lignes.*.quantite' => 'required|integer|min:0',
             'note' => 'nullable|string|max:1000',
+            'date_livraison_reliquat' => 'nullable|date',
+            'date_livraison_prevue' => 'nullable|date',
         ]);
 
         $commande = CommandeTerritoriale::with('lignes')->findOrFail($id);
@@ -131,36 +133,65 @@ class FluxCircuitController extends Controller
             return response()->json(['success' => false, 'message' => 'Cette demande n\'est plus à l\'étape antenne.'], 422);
         }
 
-        DB::transaction(function () use ($commande, $data, $user) {
+        $resultat = DB::transaction(function () use ($commande, $data, $user) {
             $totalPris = 0;
+            $totalDemande = 0;
             foreach ($data['lignes'] as $item) {
                 $ligne = $commande->lignes->firstWhere('id', (int) $item['id']);
                 if (!$ligne) {
                     continue;
                 }
                 $reste = max(0, (int) $ligne->quantite_demandee - (int) ($ligne->quantite_prise_antenne ?? 0));
-                $qte = min($reste, (int) $item['quantite']);
+                $qteDemandee = min($reste, (int) $item['quantite']);
+                if ($qteDemandee <= 0) {
+                    continue;
+                }
+                $qte = $qteDemandee;
+                if ($ligne->produit_id) {
+                    $qte = $this->debiterStockAntenne((int) $commande->antenne_id, (int) $ligne->produit_id, $qteDemandee);
+                }
                 if ($qte <= 0) {
                     continue;
                 }
-                if ($ligne->produit_id) {
-                    $this->debiterStockAntenne((int) $commande->antenne_id, (int) $ligne->produit_id, $qte);
-                }
+                $priseAntenne = (int) ($ligne->quantite_prise_antenne ?? 0) + $qte;
+                $reliquat = max(0, (int) $ligne->quantite_demandee - $priseAntenne);
                 $ligne->update([
-                    'quantite_prise_antenne' => (int) ($ligne->quantite_prise_antenne ?? 0) + $qte,
+                    'quantite_prise_antenne' => $priseAntenne,
+                    'quantite_reliquat' => $reliquat,
                 ]);
                 $totalPris += $qte;
             }
 
-            $demande = $commande->lignes()->sum('quantite_demandee');
-            $priseAntenne = $commande->lignes()->sum('quantite_prise_antenne');
-            $statut = $priseAntenne >= $demande ? 'SATISFAITE_ANTENNE' : 'PARTIELLEMENT_ANTENNE';
+            $commande->refresh()->load('lignes');
+            $demande = $commande->lignes->sum(fn ($l) => (int) $l->quantite_demandee);
+            $priseAntenne = $commande->lignes->sum(fn ($l) => (int) ($l->quantite_prise_antenne ?? 0));
+            $reliquat = max(0, $demande - $priseAntenne);
+            $statut = $reliquat <= 0 ? 'SATISFAITE_ANTENNE' : 'PARTIELLEMENT_ANTENNE';
 
-            $commande->update([
+            $dateReliquat = $data['date_livraison_reliquat'] ?? $data['date_livraison_prevue'] ?? null;
+            if ($reliquat > 0 && empty($dateReliquat)) {
+                abort(response()->json([
+                    'success' => false,
+                    'message' => 'Indiquez la date de livraison prévue du reliquat (stock insuffisant).',
+                ], 422));
+            }
+
+            $maj = [
                 'statut' => $statut,
                 'prise_en_charge_antenne_at' => now(),
                 'prise_en_charge_antenne_par_nom' => $user->name,
-            ]);
+            ];
+            if ($reliquat > 0 && $dateReliquat) {
+                $maj['date_livraison_reliquat'] = $dateReliquat;
+                $maj['date_livraison_prevue'] = $dateReliquat;
+            } elseif ($reliquat <= 0) {
+                $maj['date_livraison_reliquat'] = null;
+            }
+            $commande->update($maj);
+
+            $detail = ($data['note'] ?? null)
+                ?: ("Prise stock antenne : {$totalPris} unité(s)"
+                    .($reliquat > 0 ? " · reliquat {$reliquat} prévu le {$dateReliquat}" : ' · satisfaite localement'));
             $commande->journal()->create([
                 'user_id' => $user->id,
                 'antenne_id' => $commande->antenne_id,
@@ -168,11 +199,106 @@ class FluxCircuitController extends Controller
                 'auteur_role' => $user->role,
                 'action' => 'PRISE_ANTENNE',
                 'statut' => $statut,
-                'detail' => ($data['note'] ?? null) ?: ("Prise stock antenne : {$totalPris} unité(s)"),
+                'detail' => $detail,
             ]);
+
+            return ['total_pris' => $totalPris, 'reliquat' => $reliquat, 'demande' => $demande];
         });
 
-        return response()->json(['success' => true, 'commande' => $commande->fresh(['antenne', 'lignes', 'journal'])]);
+        if (($resultat['total_pris'] ?? 0) <= 0) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Stock insuffisant : aucune quantité n\'a pu être débitée.',
+            ], 422);
+        }
+
+        return response()->json([
+            'success' => true,
+            'commande' => $commande->fresh(['antenne', 'lignes', 'journal']),
+            'prise' => $resultat,
+        ]);
+    }
+
+    /** Entrée de stock (lot FEFO) pour l'antenne du chef. */
+    public function entreeStockAntenne(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (!in_array($user->code_role, self::ROLES_ANTENNE, true)) {
+            return response()->json(['success' => false, 'message' => 'Réservé au chef d\'antenne.'], 403);
+        }
+        if (!Schema::hasTable('lots_produits')) {
+            return response()->json(['success' => false, 'message' => 'Table des lots indisponible.'], 422);
+        }
+
+        $data = $request->validate([
+            'produit_id' => 'required|integer|exists:produits_pharmaceutiques,id',
+            'quantite' => 'required|integer|min:1',
+            'numero_lot' => 'nullable|string|max:80',
+            'date_peremption' => 'nullable|date',
+            'laboratoire_fabricant' => 'nullable|string|max:120',
+        ]);
+
+        $antenneId = $user->antenne_id ?: $user->province_id;
+        $produit = ProduitPharmaceutique::findOrFail($data['produit_id']);
+        $lot = LotProduit::create([
+            'produit_id' => $produit->id,
+            'antenne_id' => $antenneId,
+            'numero_lot' => $data['numero_lot'] ?: ('LOT-'.now()->format('YmdHis')),
+            'quantite_disponible' => (int) $data['quantite'],
+            'quantite_reservee' => 0,
+            'date_peremption' => $data['date_peremption'] ?? now()->addYear()->toDateString(),
+            'laboratoire_fabricant' => $data['laboratoire_fabricant'] ?? null,
+            'statut_fefo' => 'ACTIF',
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'lot' => [
+                'id' => $lot->id,
+                'produit_id' => $lot->produit_id,
+                'designation' => $produit->designation,
+                'numero_lot' => $lot->numero_lot,
+                'quantite_disponible' => (int) $lot->quantite_disponible,
+                'date_peremption' => optional($lot->date_peremption)->format('Y-m-d'),
+            ],
+        ], 201);
+    }
+
+    /** Ajuste la quantité d'un lot de l'antenne (inventaire / correction). */
+    public function ajusterStockAntenne(Request $request, int $lotId): JsonResponse
+    {
+        $user = $request->user();
+        if (!in_array($user->code_role, self::ROLES_ANTENNE, true)) {
+            return response()->json(['success' => false, 'message' => 'Réservé au chef d\'antenne.'], 403);
+        }
+
+        $data = $request->validate([
+            'quantite_disponible' => 'required|integer|min:0',
+            'motif' => 'nullable|string|max:255',
+        ]);
+
+        $antenneId = $user->antenne_id ?: $user->province_id;
+        $lot = LotProduit::with('produit:id,designation')->findOrFail($lotId);
+        if ((int) $lot->antenne_id !== (int) $antenneId
+            && !in_array($user->code_role, ['SUPER_ADMIN', 'ADMIN_METIER'], true)) {
+            return response()->json(['success' => false, 'message' => 'Ce lot n\'appartient pas à votre antenne.'], 403);
+        }
+
+        $avant = (int) $lot->quantite_disponible;
+        $lot->update(['quantite_disponible' => (int) $data['quantite_disponible']]);
+
+        return response()->json([
+            'success' => true,
+            'lot' => [
+                'id' => $lot->id,
+                'produit_id' => $lot->produit_id,
+                'designation' => $lot->produit?->designation,
+                'numero_lot' => $lot->numero_lot,
+                'quantite_disponible' => (int) $lot->quantite_disponible,
+                'avant' => $avant,
+                'motif' => $data['motif'] ?? null,
+            ],
+        ]);
     }
 
     /**
@@ -487,12 +613,17 @@ class FluxCircuitController extends Controller
         ];
     }
 
-    private function debiterStockAntenne(int $antenneId, int $produitId, int $qte): void
+    /** Débite le stock FEFO et retourne la quantité réellement servie. */
+    private function debiterStockAntenne(int $antenneId, int $produitId, int $qte): int
     {
+        if ($qte <= 0) {
+            return 0;
+        }
         if (!Schema::hasTable('lots_produits')) {
-            return;
+            return $qte; // sans table lots : on autorise (mode démo / seed partiel)
         }
         $reste = $qte;
+        $servi = 0;
         $lots = LotProduit::query()
             ->where('antenne_id', $antenneId)
             ->where('produit_id', $produitId)
@@ -509,6 +640,9 @@ class FluxCircuitController extends Controller
             $prise = min($dispo, $reste);
             $lot->update(['quantite_disponible' => $dispo - $prise]);
             $reste -= $prise;
+            $servi += $prise;
         }
+
+        return $servi;
     }
 }

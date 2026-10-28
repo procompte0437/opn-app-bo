@@ -304,21 +304,37 @@ class FluxApprovisionnementController extends Controller
             return response()->json(['success' => false, 'message' => 'Seul le chef d\'antenne peut transférer une commande au siège.'], 403);
         }
 
-        $data = $request->validate(['note' => 'nullable|string|max:1000']);
+        $data = $request->validate([
+            'note' => 'nullable|string|max:1000',
+            'date_livraison_prevue' => 'nullable|date',
+            'date_livraison_reliquat' => 'nullable|date',
+        ]);
         $commande = CommandeTerritoriale::with(['lignes', 'antenne'])->findOrFail($id);
         $antenneUser = $this->antenneIdUtilisateur($user);
         if (!in_array($user->code_role, ['SUPER_ADMIN', 'ADMIN_METIER'], true) && (int) $commande->antenne_id !== (int) $antenneUser) {
             return response()->json(['success' => false, 'message' => 'Cette commande n\'appartient pas à votre antenne.'], 403);
         }
-        if (!in_array($commande->statut, ['SOUMISE_ANTENNE', 'EFFECTUEE_CHEF_ANTENNE'], true)) {
-            return response()->json(['success' => false, 'message' => 'Seules les commandes reçues à l\'antenne peuvent être transférées au siège.'], 422);
+        if (!in_array($commande->statut, ['SOUMISE_ANTENNE', 'EFFECTUEE_CHEF_ANTENNE', 'PARTIELLEMENT_ANTENNE'], true)) {
+            return response()->json(['success' => false, 'message' => 'Seules les commandes reçues à l\'antenne (y compris partiellement servies) peuvent être transférées au siège.'], 422);
         }
 
         $now = now();
-        $qteTotale = $commande->lignes->sum(fn ($l) => (int) $l->quantite_demandee);
+        $qteTotale = $commande->lignes->sum(fn ($l) => max(
+            0,
+            (int) $l->quantite_demandee - (int) ($l->quantite_prise_antenne ?? 0)
+        ));
+        if ($qteTotale <= 0) {
+            return response()->json(['success' => false, 'message' => 'Tout a déjà été servi en antenne — rien à transférer au siège.'], 422);
+        }
+        $dateLivraison = $data['date_livraison_reliquat'] ?? $data['date_livraison_prevue'] ?? $commande->date_livraison_reliquat ?? $commande->date_livraison_prevue;
         $antenneNom = $commande->antenne?->nom ?? ('Antenne #'.$commande->antenne_id);
 
-        DB::transaction(function () use ($commande, $user, $data, $now, $qteTotale, $antenneNom) {
+        DB::transaction(function () use ($commande, $user, $data, $now, $qteTotale, $antenneNom, $dateLivraison) {
+            foreach ($commande->lignes as $ligne) {
+                $reste = max(0, (int) $ligne->quantite_demandee - (int) ($ligne->quantite_prise_antenne ?? 0));
+                $ligne->update(['quantite_reliquat' => $reste]);
+            }
+
             $commande->update([
                 'statut' => 'TRANSFEREE_SIEGE',
                 'transferee_au_siege_at' => $now,
@@ -326,6 +342,8 @@ class FluxApprovisionnementController extends Controller
                 'transferee_au_siege_par_nom' => $user->name,
                 'transmise_at' => $commande->transmise_at ?: $now,
                 'transmise_par_nom' => $user->name,
+                'date_livraison_prevue' => $dateLivraison ?: $commande->date_livraison_prevue,
+                'date_livraison_reliquat' => $dateLivraison ?: $commande->date_livraison_reliquat,
             ]);
 
             FluxTransfertSiege::create([
@@ -340,11 +358,12 @@ class FluxApprovisionnementController extends Controller
                 'nb_lignes' => $commande->lignes->count(),
                 'quantite_totale' => $qteTotale,
                 'transferee_at' => $now,
-                'detail' => $data['note'] ?? 'Transfert de la commande au siège OPN',
+                'detail' => $data['note'] ?? 'Transfert de la commande au siège OPN (reste après stock antenne)',
             ]);
 
             $detail = $data['note']
-                ?? 'Transférée au siège par '.$user->name.' (antenne '.$antenneNom.', '.$qteTotale.' unité(s) demandée(s))';
+                ?? 'Transférée au siège par '.$user->name.' (antenne '.$antenneNom.', '.$qteTotale.' unité(s) restantes)'
+                    .($dateLivraison ? ', livraison prévue '.$dateLivraison : '');
             $this->journaliser($commande->fresh(), $user, 'TRANSFERT', $detail);
         });
 
@@ -371,6 +390,8 @@ class FluxApprovisionnementController extends Controller
             'lignes.*.quantite' => 'required_with:lignes|integer|min:0',
             'tout' => 'nullable|boolean',
             'note' => 'nullable|string|max:1000',
+            'date_livraison_reliquat' => 'nullable|date',
+            'date_livraison_prevue' => 'nullable|date',
         ]);
 
         $commande = CommandeTerritoriale::with('lignes')->findOrFail($id);
@@ -383,7 +404,8 @@ class FluxApprovisionnementController extends Controller
 
         $plan = [];
         foreach ($commande->lignes as $row) {
-            $reliquat = max(0, (int) $row->quantite_demandee - (int) $row->quantite_prise_en_charge);
+            $priseAntenne = (int) ($row->quantite_prise_antenne ?? 0);
+            $reliquat = max(0, (int) $row->quantite_demandee - $priseAntenne - (int) $row->quantite_prise_en_charge);
             if ($reliquat <= 0) {
                 continue;
             }
@@ -408,27 +430,45 @@ class FluxApprovisionnementController extends Controller
         DB::transaction(function () use ($commande, $plan, $user, $data, $totalPris, &$piecesGenerees) {
             foreach ($plan as $item) {
                 $row = $item['row'];
+                $priseAntenne = (int) ($row->quantite_prise_antenne ?? 0);
                 $prise = (int) $row->quantite_prise_en_charge + $item['qte'];
                 $row->update([
                     'quantite_prise_en_charge' => $prise,
-                    'quantite_reliquat' => max(0, (int) $row->quantite_demandee - $prise),
+                    'quantite_reliquat' => max(0, (int) $row->quantite_demandee - $priseAntenne - $prise),
                 ]);
             }
 
             $commande->refresh()->load(['lignes', 'antenne']);
             $statut = $this->calculerStatut($commande);
-            $archive = $commande->lignes->sum(fn ($l) => max(0, (int) $l->quantite_demandee - (int) $l->quantite_prise_en_charge));
-            $commande->update([
+            $archive = $commande->lignes->sum(fn ($l) => max(
+                0,
+                (int) $l->quantite_demandee - (int) ($l->quantite_prise_antenne ?? 0) - (int) $l->quantite_prise_en_charge
+            ));
+            $dateReliquat = $data['date_livraison_reliquat'] ?? $data['date_livraison_prevue'] ?? null;
+            if ($archive > 0 && empty($dateReliquat) && empty($commande->date_livraison_reliquat)) {
+                abort(response()->json([
+                    'success' => false,
+                    'message' => 'Indiquez la date de livraison prévue du reliquat.',
+                ], 422));
+            }
+            $maj = [
                 'statut' => $statut,
                 'prise_en_charge_siege_at' => $commande->prise_en_charge_siege_at ?: now(),
                 'prise_en_charge_siege_par_nom' => $user->name,
                 'transmise_at' => $commande->transmise_at ?: now(),
                 'transmise_par_nom' => $user->name,
-            ]);
+            ];
+            if ($archive > 0 && $dateReliquat) {
+                $maj['date_livraison_reliquat'] = $dateReliquat;
+                $maj['date_livraison_prevue'] = $dateReliquat;
+            } elseif ($archive <= 0) {
+                $maj['date_livraison_reliquat'] = null;
+            }
+            $commande->update($maj);
 
             $detail = $data['note']
                 ?? ($archive > 0
-                    ? "Prise en charge siège : {$totalPris} unité(s). {$archive} unité(s) en reliquat."
+                    ? "Prise en charge siège : {$totalPris} unité(s). {$archive} unité(s) en reliquat".($dateReliquat ? " (livraison {$dateReliquat})" : '').'.'
                     : "Prise en charge siège complète ({$totalPris} unité(s)).");
 
             $prise = FluxPriseEnChargeSiege::create([
@@ -666,7 +706,10 @@ class FluxApprovisionnementController extends Controller
     private function calculerStatut(CommandeTerritoriale $commande): string
     {
         $lignes = $commande->lignes;
-        $reliquat = $lignes->sum(fn ($l) => max(0, (int) $l->quantite_demandee - (int) $l->quantite_prise_en_charge));
+        $reliquat = $lignes->sum(fn ($l) => max(
+            0,
+            (int) $l->quantite_demandee - (int) ($l->quantite_prise_antenne ?? 0) - (int) $l->quantite_prise_en_charge
+        ));
         $prise = $lignes->sum(fn ($l) => (int) $l->quantite_prise_en_charge);
         $dispersee = $lignes->sum(fn ($l) => (int) $l->quantite_dispersee);
         $resteDispersion = $lignes->sum(fn ($l) => max(0, (int) $l->quantite_prise_en_charge - (int) $l->quantite_dispersee));
@@ -890,7 +933,8 @@ class FluxApprovisionnementController extends Controller
         $demande = $lignes->sum(fn ($l) => (int) $l->quantite_demandee);
         $prise = $lignes->sum(fn ($l) => (int) $l->quantite_prise_en_charge);
         $dispersee = $lignes->sum(fn ($l) => (int) $l->quantite_dispersee);
-        $reliquat = max(0, $demande - $prise);
+        $priseAntenne = $lignes->sum(fn ($l) => (int) ($l->quantite_prise_antenne ?? 0));
+        $reliquat = max(0, $demande - $priseAntenne - $prise);
 
         $commande->setAttribute('tracabilite', [
             'initiee_par' => $commande->demandeur_nom,
@@ -902,12 +946,13 @@ class FluxApprovisionnementController extends Controller
             'transferee_at' => $commande->transferee_au_siege_at,
             'prise_en_charge_par' => $commande->prise_en_charge_siege_par_nom,
             'prise_en_charge_at' => $commande->prise_en_charge_siege_at,
+            'prise_antenne_par' => $commande->prise_en_charge_antenne_par_nom,
+            'prise_antenne_at' => $commande->prise_en_charge_antenne_at,
             'dispersee_par' => $commande->dispersee_par_nom,
             'dispersee_at' => $commande->dispersee_at,
         ]);
         $commande->setAttribute('initiee_par_antenne', ($commande->partenaire_type ?? '') === 'ANTENNE');
         $commande->setAttribute('initiee_par_direction_generale', ($commande->partenaire_type ?? '') === 'DIRECTION_GENERALE');
-        $priseAntenne = $lignes->sum(fn ($l) => (int) ($l->quantite_prise_antenne ?? 0));
         $commande->setAttribute('quantites', [
             'demandee' => $demande,
             'prise_antenne' => $priseAntenne,
@@ -918,6 +963,7 @@ class FluxApprovisionnementController extends Controller
         $commande->setAttribute('categorie', $commande->categorie);
         $commande->setAttribute('kit_medical', $commande->kit_medical);
         $commande->setAttribute('date_livraison_prevue', optional($commande->date_livraison_prevue)->format('Y-m-d'));
+        $commande->setAttribute('date_livraison_reliquat', optional($commande->date_livraison_reliquat)->format('Y-m-d'));
         $commande->setAttribute('bc_global_id', $commande->bc_global_id);
 
         if ($commande->relationLoaded('pieces')) {

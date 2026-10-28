@@ -24,6 +24,7 @@ class CommandeTerritoriale extends Model
         'kit_medical',
         'bc_global_id',
         'date_livraison_prevue',
+        'date_livraison_reliquat',
         'prise_en_charge_antenne_at',
         'prise_en_charge_antenne_par_nom',
         'montant_total_xaf',
@@ -46,6 +47,7 @@ class CommandeTerritoriale extends Model
         'prise_en_charge_siege_at' => 'datetime',
         'prise_en_charge_antenne_at' => 'datetime',
         'date_livraison_prevue' => 'date',
+        'date_livraison_reliquat' => 'date',
         'dispersee_at' => 'datetime',
     ];
 

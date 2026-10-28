@@ -172,6 +172,8 @@ Route::prefix('v1')->group(function () {
         Route::post('/flux/commandes/{id}/envoyer', [FluxCircuitController::class, 'envoyer']);
         Route::post('/flux/commandes/{id}/prise-antenne', [FluxCircuitController::class, 'priseAntenne']);
         Route::get('/flux/stock-antenne', [FluxCircuitController::class, 'stockAntenne']);
+        Route::post('/flux/stock-antenne/entree', [FluxCircuitController::class, 'entreeStockAntenne']);
+        Route::put('/flux/stock-antenne/{lotId}', [FluxCircuitController::class, 'ajusterStockAntenne']);
         Route::get('/flux/categories', [FluxCircuitController::class, 'categoriesProduits']);
         Route::get('/flux/bc-globaux', [FluxCircuitController::class, 'listerBcGlobaux']);
         Route::post('/flux/bc-globaux', [FluxCircuitController::class, 'creerBcGlobal']);
