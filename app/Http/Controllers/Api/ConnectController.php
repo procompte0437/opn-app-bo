@@ -438,14 +438,37 @@ class ConnectController extends Controller
     public function directory(Request $request): JsonResponse
     {
         $user = $request->user();
+        $since = now()->subMinutes(PresenceController::ONLINE_WINDOW_MINUTES);
 
         $users = User::query()
             ->where('id', '!=', $user->id)
             ->orderBy('name')
-            ->get(['id', 'name', 'email', 'code_role', 'entite']);
+            ->get(['id', 'name', 'email', 'code_role', 'role', 'entite', 'last_seen_at'])
+            ->map(function (User $u) use ($since) {
+                $online = $u->last_seen_at !== null && $u->last_seen_at->gte($since);
+
+                return [
+                    'id' => (int) $u->id,
+                    'name' => $u->name,
+                    'nom' => $u->name,
+                    'email' => $u->email,
+                    'code_role' => $u->code_role,
+                    'role' => $u->role,
+                    'entite' => $u->entite,
+                    'online' => $online,
+                    'last_seen_at' => $u->last_seen_at?->toIso8601String(),
+                ];
+            })
+            ->sortBy([
+                ['online', 'desc'],
+                ['name', 'asc'],
+            ])
+            ->values();
 
         return response()->json([
             'success' => true,
+            'online_window_minutes' => PresenceController::ONLINE_WINDOW_MINUTES,
+            'online_count' => $users->where('online', true)->count(),
             'data' => $users,
         ]);
     }
@@ -584,6 +607,28 @@ class ConnectController extends Controller
         if (! is_array($list)) {
             $list = [];
         }
+
+        // Un join démarre une nouvelle négociation : purger offer/answer/ice obsolètes
+        // (évite de rejouer un SDP Chrome « repair-window » invalide).
+        if ($validated['type'] === 'join') {
+            $uid = (int) $user->id;
+            $list = array_values(array_filter($list, static function ($item) use ($uid) {
+                if (! is_array($item)) {
+                    return false;
+                }
+                $type = (string) ($item['type'] ?? '');
+                if (in_array($type, ['offer', 'answer', 'ice', 'hangup', 'renegotiate'], true)) {
+                    return false;
+                }
+                // Remplacer l'ancien join du même utilisateur
+                if ($type === 'join' && (int) ($item['from_user_id'] ?? 0) === $uid) {
+                    return false;
+                }
+
+                return true;
+            }));
+        }
+
         $list[] = $signal;
         // garder les 80 derniers signaux (fenêtre courte d'appel)
         $list = array_slice($list, -80);
@@ -659,6 +704,9 @@ class ConnectController extends Controller
                 'jitsi_room' => 'opn-connect-'.Str::lower(Str::random(24)),
             ])->save();
         }
+
+        // Nouvelle session : purger les signaux WebRTC obsolètes (évite offres/ICE orphelines)
+        Cache::forget('opn_visio_signals:'.$conversation->id);
 
         $title = $validated['title'] ?? $conversation->title ?? 'Visioconférence OPN';
         $body = $user->name.' vous invite à rejoindre la visioconférence « '.$title.' ».';
@@ -774,7 +822,14 @@ class ConnectController extends Controller
         });
 
         $message->load(['sender']);
-        event(new ConnectMessageCreated($message));
+
+        // Le temps réel (Reverb) est optionnel : ne jamais faire échouer
+        // l'invitation visio / le message si le broker WebSocket est down.
+        try {
+            event(new ConnectMessageCreated($message));
+        } catch (\Throwable $broadcastError) {
+            report($broadcastError);
+        }
 
         return $message;
     }

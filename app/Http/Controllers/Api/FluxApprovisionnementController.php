@@ -5,10 +5,12 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\AntenneProvinciale;
 use App\Models\CommandeTerritoriale;
+use App\Models\FluxNotification;
 use App\Models\FluxPieceCommerciale;
 use App\Models\FluxPriseEnChargeSiege;
 use App\Models\FluxTransfertSiege;
 use App\Models\ProduitPharmaceutique;
+use App\Models\User;
 use App\Services\FluxPieceCommercialeService;
 use App\Services\FluxPiecePdfService;
 use Illuminate\Http\JsonResponse;
@@ -392,11 +394,22 @@ class FluxApprovisionnementController extends Controller
             'note' => 'nullable|string|max:1000',
             'date_livraison_reliquat' => 'nullable|date',
             'date_livraison_prevue' => 'nullable|date',
+            'urgence_specifique' => 'nullable|boolean',
         ]);
 
         $commande = CommandeTerritoriale::with('lignes')->findOrFail($id);
         if (!in_array($commande->statut, ['TRANSFEREE_SIEGE', 'TRANSMISE_SIEGE', 'PARTIELLEMENT_TRANSMISE', 'PARTIELLEMENT_ARCHIVEE', 'PARTIELLEMENT_DISPERSEE'], true)) {
             return response()->json(['success' => false, 'message' => 'La commande doit d\'abord être transférée par l\'antenne.'], 422);
+        }
+        // Prise individuelle hors BC = cas urgent/rare : le flag est obligatoire pour traçabilité + notif chef.
+        $urgence = (bool) ($data['urgence_specifique'] ?? false);
+        if ($commande->bc_global_id && !$urgence) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cette demande fait partie d\'un BC global. Prenez en charge le BC global antenne, ou confirmez une prise urgente spécifique.',
+                'bc_global_id' => $commande->bc_global_id,
+                'requiert_urgence' => true,
+            ], 422);
         }
 
         $selections = collect($data['lignes'] ?? []);
@@ -427,7 +440,7 @@ class FluxApprovisionnementController extends Controller
         $totalPris = array_sum(array_column($plan, 'qte'));
         $piecesGenerees = null;
 
-        DB::transaction(function () use ($commande, $plan, $user, $data, $totalPris, &$piecesGenerees) {
+        DB::transaction(function () use ($commande, $plan, $user, $data, $totalPris, $urgence, &$piecesGenerees) {
             foreach ($plan as $item) {
                 $row = $item['row'];
                 $priseAntenne = (int) ($row->quantite_prise_antenne ?? 0);
@@ -498,16 +511,75 @@ class FluxApprovisionnementController extends Controller
                 $commande->fresh(),
                 $user,
                 'PRISE_EN_CHARGE',
-                $detail.' Documents : '.$piecesGenerees['bon_commande']->numero.' / '.$piecesGenerees['facture']->numero
+                ($urgence ? '[URGENCE SPÉCIFIQUE] ' : '').$detail.' Documents : '.$piecesGenerees['bon_commande']->numero.' / '.$piecesGenerees['facture']->numero
             );
         });
 
+        $commandeFraiche = $commande->fresh(['antenne', 'lignes', 'journal', 'pieces']);
+        if ($urgence) {
+            $this->notifierChefPriseUrgente($commandeFraiche, $user, $totalPris, $data['note'] ?? null);
+        }
+
         return response()->json([
             'success' => true,
-            'commande' => $this->enrichirCommande($commande->fresh(['antenne', 'lignes', 'journal', 'pieces'])),
+            'commande' => $this->enrichirCommande($commandeFraiche),
             'bon_commande' => $piecesGenerees['bon_commande'] ?? null,
             'facture' => $piecesGenerees['facture'] ?? null,
+            'urgence_specifique' => $urgence,
+            'chef_notifie' => $urgence,
         ]);
+    }
+
+    /** Notifie le(s) chef(s) d'antenne qu'une prise individuelle urgente a été faite hors BC global. */
+    private function notifierChefPriseUrgente(CommandeTerritoriale $commande, $user, int $totalPris, ?string $note = null): void
+    {
+        $antenneId = $commande->antenne_id;
+        $titre = 'Prise urgente siège hors BC global';
+        $message = sprintf(
+            '%s a pris en charge de manière spécifique la demande %s (%s, %d u.)%s. Action urgente hors commande globale antenne.',
+            $user->name,
+            $commande->numero_commande,
+            $commande->demandeur_nom ?: 'demandeur',
+            $totalPris,
+            $note ? ' — '.$note : ''
+        );
+
+        $chefs = User::query()
+            ->whereIn('code_role', ['CHEF_ANTENNE_PROVINCIALE', 'PHARMACIEN_CHEF_ANTENNE'])
+            ->where(function ($q) use ($antenneId) {
+                $q->where('antenne_id', $antenneId)->orWhere('province_id', $antenneId);
+            })
+            ->get();
+
+        if ($chefs->isEmpty()) {
+            FluxNotification::create([
+                'destinataire_user_id' => null,
+                'antenne_id' => $antenneId,
+                'type' => 'PRISE_URGENTE_SIEGE',
+                'titre' => $titre,
+                'message' => $message,
+                'commande_id' => $commande->id,
+                'bc_global_id' => $commande->bc_global_id,
+                'auteur_nom' => $user->name,
+                'auteur_role' => $user->role ?: $user->code_role,
+            ]);
+
+            return;
+        }
+
+        foreach ($chefs as $chef) {
+            FluxNotification::create([
+                'destinataire_user_id' => $chef->id,
+                'antenne_id' => $antenneId,
+                'type' => 'PRISE_URGENTE_SIEGE',
+                'titre' => $titre,
+                'message' => $message,
+                'commande_id' => $commande->id,
+                'bc_global_id' => $commande->bc_global_id,
+                'auteur_nom' => $user->name,
+                'auteur_role' => $user->role ?: $user->code_role,
+            ]);
+        }
     }
 
     /**

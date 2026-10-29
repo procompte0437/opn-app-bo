@@ -23,6 +23,8 @@ class FluxBcGlobal extends Model
         'cree_par_user_id',
         'cree_par_nom',
         'transferee_au_siege_at',
+        'prise_en_charge_siege_at',
+        'prise_en_charge_siege_par_nom',
         'retour_siege_at',
         'note',
     ];
@@ -31,6 +33,7 @@ class FluxBcGlobal extends Model
         'montant_total_xaf' => 'decimal:2',
         'date_livraison_prevue' => 'date',
         'transferee_au_siege_at' => 'datetime',
+        'prise_en_charge_siege_at' => 'datetime',
         'retour_siege_at' => 'datetime',
     ];
 

@@ -178,6 +178,9 @@ Route::prefix('v1')->group(function () {
         Route::get('/flux/bc-globaux', [FluxCircuitController::class, 'listerBcGlobaux']);
         Route::post('/flux/bc-globaux', [FluxCircuitController::class, 'creerBcGlobal']);
         Route::post('/flux/bc-globaux/{id}/transferer', [FluxCircuitController::class, 'transfererBcGlobal']);
+        Route::post('/flux/bc-globaux/{id}/prise-en-charge', [FluxCircuitController::class, 'priseEnChargeBcGlobal']);
+        Route::get('/flux/notifications', [FluxCircuitController::class, 'notifications']);
+        Route::post('/flux/notifications/{id}/lire', [FluxCircuitController::class, 'marquerNotificationLue']);
         Route::post('/flux/bons-livraison', [FluxCircuitController::class, 'genererBl']);
 
         Route::get('/parametrage/territoire', [ParametrageController::class, 'territoire']);

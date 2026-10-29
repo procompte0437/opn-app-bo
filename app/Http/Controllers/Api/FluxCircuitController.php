@@ -7,8 +7,10 @@ use App\Models\CommandeTerritoriale;
 use App\Models\FluxBcGlobal;
 use App\Models\FluxBcGlobalLigne;
 use App\Models\FluxBonLivraison;
+use App\Models\FluxNotification;
 use App\Models\LotProduit;
 use App\Models\ProduitPharmaceutique;
+use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -466,24 +468,218 @@ class FluxCircuitController extends Controller
         $user = $request->user();
         $query = FluxBcGlobal::with('lignes')->orderByDesc('id');
 
-        if (in_array($user->code_role, self::ROLES_ANTENNE, true)
-            && !in_array($user->code_role, ['SUPER_ADMIN', 'ADMIN_METIER'], true)) {
+        $estChefSeul = in_array($user->code_role, ['CHEF_ANTENNE_PROVINCIALE', 'PHARMACIEN_CHEF_ANTENNE'], true);
+        if ($estChefSeul) {
             $antenneId = $user->antenne_id ?: $user->province_id;
             $query->where('antenne_id', $antenneId);
+        } elseif (in_array($user->code_role, self::ROLES_SIEGE, true)) {
+            // Siège : BC déjà transmis (mission principale)
+            $query->whereIn('statut', ['TRANSFERE_SIEGE', 'PARTIELLEMENT_PRISE', 'PRISE_SIEGE', 'RETOUR_SIEGE', 'LIVRE']);
         }
 
-        $avecDetails = in_array($user->code_role, self::ROLES_ANTENNE, true)
-            || in_array($user->code_role, ['SUPER_ADMIN', 'ADMIN_METIER'], true);
-
-        // Siège : jamais les détails demandeurs
-        if (in_array($user->code_role, self::ROLES_SIEGE, true)
-            && !in_array($user->code_role, ['SUPER_ADMIN', 'ADMIN_METIER'], true)) {
-            $avecDetails = false;
-        }
+        // Antenne et siège voient les détails demandeurs (composition du BC global).
+        $avecDetails = true;
 
         $liste = $query->get()->map(fn ($bc) => $this->serialiserBc($bc, $avecDetails));
 
         return response()->json(['success' => true, 'bc_globaux' => $liste]);
+    }
+
+    /**
+     * Prise en charge siège d'un BC global antenne (mission principale du siège).
+     * Répartit les quantités sur les commandes demandeurs constitutives.
+     */
+    public function priseEnChargeBcGlobal(Request $request, int $id): JsonResponse
+    {
+        $user = $request->user();
+        if (!in_array($user->code_role, self::ROLES_SIEGE, true)) {
+            return response()->json(['success' => false, 'message' => 'Seul le siège peut prendre en charge un BC global.'], 403);
+        }
+
+        $data = $request->validate([
+            'lignes' => 'nullable|array',
+            'lignes.*.id' => 'required_with:lignes|integer',
+            'lignes.*.quantite' => 'required_with:lignes|integer|min:0',
+            'tout' => 'nullable|boolean',
+            'note' => 'nullable|string|max:1000',
+            'date_livraison_reliquat' => 'nullable|date',
+            'date_livraison_prevue' => 'nullable|date',
+        ]);
+
+        $bc = FluxBcGlobal::with(['lignes', 'commandes.lignes'])->findOrFail($id);
+        if (!in_array($bc->statut, ['TRANSFERE_SIEGE', 'PARTIELLEMENT_PRISE'], true)) {
+            return response()->json(['success' => false, 'message' => 'Ce BC global n\'est pas en attente de prise en charge siège.'], 422);
+        }
+
+        $selections = collect($data['lignes'] ?? []);
+        $prendreTout = (bool) ($data['tout'] ?? false) || $selections->isEmpty();
+        $dateReliquat = $data['date_livraison_reliquat'] ?? $data['date_livraison_prevue'] ?? null;
+
+        $resultat = DB::transaction(function () use ($bc, $user, $data, $selections, $prendreTout, $dateReliquat) {
+            $totalPris = 0;
+            $resteGlobal = 0;
+
+            foreach ($bc->lignes as $ligneBc) {
+                $deja = (int) ($ligneBc->quantite_prise_siege ?? 0);
+                $dispo = max(0, (int) $ligneBc->quantite - $deja);
+                if ($dispo <= 0) {
+                    continue;
+                }
+                if ($prendreTout) {
+                    $qte = $dispo;
+                } else {
+                    $choix = $selections->firstWhere('id', $ligneBc->id);
+                    $qte = $choix ? min($dispo, max(0, (int) $choix['quantite'])) : 0;
+                }
+                if ($qte <= 0) {
+                    continue;
+                }
+
+                $resteARepartir = $qte;
+                $details = collect($ligneBc->details_demandeurs ?: []);
+                foreach ($details as $detail) {
+                    if ($resteARepartir <= 0) {
+                        break;
+                    }
+                    $cmd = $bc->commandes->firstWhere('id', (int) ($detail['commande_id'] ?? 0));
+                    if (!$cmd) {
+                        continue;
+                    }
+                    $ligneCmd = $cmd->lignes->first(function ($l) use ($ligneBc) {
+                        if ($ligneBc->produit_id && (int) $l->produit_id === (int) $ligneBc->produit_id) {
+                            return true;
+                        }
+
+                        return mb_strtolower(trim($l->designation)) === mb_strtolower(trim($ligneBc->designation));
+                    });
+                    if (!$ligneCmd) {
+                        continue;
+                    }
+                    $priseAntenne = (int) ($ligneCmd->quantite_prise_antenne ?? 0);
+                    $reliquatCmd = max(0, (int) $ligneCmd->quantite_demandee - $priseAntenne - (int) $ligneCmd->quantite_prise_en_charge);
+                    if ($reliquatCmd <= 0) {
+                        continue;
+                    }
+                    $allouer = min($reliquatCmd, $resteARepartir);
+                    $nouvellePrise = (int) $ligneCmd->quantite_prise_en_charge + $allouer;
+                    $nouveauReliquat = max(0, (int) $ligneCmd->quantite_demandee - $priseAntenne - $nouvellePrise);
+                    $ligneCmd->update([
+                        'quantite_prise_en_charge' => $nouvellePrise,
+                        'quantite_reliquat' => $nouveauReliquat,
+                    ]);
+                    $resteARepartir -= $allouer;
+                    $totalPris += $allouer;
+                }
+
+                $priseLigne = $deja + ($qte - $resteARepartir);
+                $ligneBc->update(['quantite_prise_siege' => $priseLigne]);
+                $resteGlobal += max(0, (int) $ligneBc->quantite - $priseLigne);
+            }
+
+            if ($totalPris <= 0) {
+                abort(response()->json(['success' => false, 'message' => 'Aucune quantité à prendre en charge sur ce BC.'], 422));
+            }
+            if ($resteGlobal > 0 && empty($dateReliquat) && empty($bc->date_livraison_prevue)) {
+                abort(response()->json([
+                    'success' => false,
+                    'message' => 'Indiquez la date de livraison prévue du reliquat du BC global.',
+                ], 422));
+            }
+
+            foreach ($bc->commandes as $cmd) {
+                $cmd->refresh()->load('lignes');
+                $demande = $cmd->lignes->sum(fn ($l) => (int) $l->quantite_demandee);
+                $priseAntenne = $cmd->lignes->sum(fn ($l) => (int) ($l->quantite_prise_antenne ?? 0));
+                $prise = $cmd->lignes->sum(fn ($l) => (int) $l->quantite_prise_en_charge);
+                $reliquat = max(0, $demande - $priseAntenne - $prise);
+                $statut = $reliquat > 0
+                    ? ($prise > 0 ? 'PARTIELLEMENT_ARCHIVEE' : 'TRANSFEREE_SIEGE')
+                    : ($prise > 0 ? 'TRANSMISE_SIEGE' : $cmd->statut);
+                $maj = [
+                    'statut' => $statut,
+                    'prise_en_charge_siege_at' => $cmd->prise_en_charge_siege_at ?: now(),
+                    'prise_en_charge_siege_par_nom' => $user->name,
+                ];
+                if ($reliquat > 0 && $dateReliquat) {
+                    $maj['date_livraison_reliquat'] = $dateReliquat;
+                    $maj['date_livraison_prevue'] = $dateReliquat;
+                }
+                $cmd->update($maj);
+                $cmd->journal()->create([
+                    'user_id' => $user->id,
+                    'antenne_id' => $cmd->antenne_id,
+                    'auteur_nom' => $user->name,
+                    'auteur_role' => $user->role,
+                    'action' => 'PRISE_EN_CHARGE',
+                    'statut' => $statut,
+                    'detail' => ($data['note'] ?? null) ?: ('Prise via BC global '.$bc->numero),
+                ]);
+            }
+
+            $bc->refresh()->load('lignes');
+            $resteBc = $bc->lignes->sum(fn ($l) => max(0, (int) $l->quantite - (int) ($l->quantite_prise_siege ?? 0)));
+            $statutBc = $resteBc > 0 ? 'PARTIELLEMENT_PRISE' : 'PRISE_SIEGE';
+            $majBc = [
+                'statut' => $statutBc,
+                'prise_en_charge_siege_at' => $bc->prise_en_charge_siege_at ?: now(),
+                'prise_en_charge_siege_par_nom' => $user->name,
+            ];
+            if ($resteBc > 0 && $dateReliquat) {
+                $majBc['date_livraison_prevue'] = $dateReliquat;
+            }
+            $bc->update($majBc);
+
+            return ['total_pris' => $totalPris, 'reste' => $resteBc, 'statut' => $statutBc];
+        });
+
+        return response()->json([
+            'success' => true,
+            'bc_global' => $this->serialiserBc($bc->fresh('lignes'), true),
+            'prise' => $resultat,
+            'message' => 'BC global pris en charge par le siège.',
+        ]);
+    }
+
+    /** Notifications flux pour le profil connecté (ex. chef antenne). */
+    public function notifications(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $query = FluxNotification::query()->orderByDesc('id')->limit(50);
+
+        if (in_array($user->code_role, ['CHEF_ANTENNE_PROVINCIALE', 'PHARMACIEN_CHEF_ANTENNE'], true)) {
+            $antenneId = $user->antenne_id ?: $user->province_id;
+            $query->where(function ($q) use ($user, $antenneId) {
+                $q->where('destinataire_user_id', $user->id);
+                if ($antenneId) {
+                    $q->orWhere('antenne_id', $antenneId);
+                }
+            });
+        } else {
+            $query->where('destinataire_user_id', $user->id);
+        }
+
+        $items = $query->get();
+
+        return response()->json([
+            'success' => true,
+            'notifications' => $items,
+            'non_lues' => $items->whereNull('lu_at')->count(),
+        ]);
+    }
+
+    public function marquerNotificationLue(Request $request, int $id): JsonResponse
+    {
+        $user = $request->user();
+        $notif = FluxNotification::findOrFail($id);
+        $antenneId = $user->antenne_id ?: $user->province_id;
+        $autorise = (int) $notif->destinataire_user_id === (int) $user->id
+            || ((int) $notif->antenne_id === (int) $antenneId && in_array($user->code_role, self::ROLES_ANTENNE, true));
+        if (!$autorise) {
+            return response()->json(['success' => false, 'message' => 'Notification inaccessible.'], 403);
+        }
+        $notif->update(['lu_at' => now()]);
+
+        return response()->json(['success' => true, 'notification' => $notif]);
     }
 
     /** Génère un BL avec signature numérique ou manuscrite (après / pendant dispersion). */
@@ -584,6 +780,9 @@ class FluxCircuitController extends Controller
 
     private function serialiserBc(FluxBcGlobal $bc, bool $avecDetails): array
     {
+        $priseSiege = $bc->lignes->sum(fn ($l) => (int) ($l->quantite_prise_siege ?? 0));
+        $reste = max(0, (int) $bc->quantite_totale - $priseSiege);
+
         return [
             'id' => $bc->id,
             'numero' => $bc->numero,
@@ -593,10 +792,14 @@ class FluxCircuitController extends Controller
             'nb_demandes' => $bc->nb_demandes,
             'nb_demandeurs' => $bc->nb_demandeurs,
             'quantite_totale' => $bc->quantite_totale,
+            'quantite_prise_siege' => $priseSiege,
+            'quantite_reliquat' => $reste,
             'montant_total_xaf' => $bc->montant_total_xaf,
             'date_livraison_prevue' => optional($bc->date_livraison_prevue)->format('Y-m-d'),
             'cree_par_nom' => $bc->cree_par_nom,
             'transferee_au_siege_at' => optional($bc->transferee_au_siege_at)->toIso8601String(),
+            'prise_en_charge_siege_at' => optional($bc->prise_en_charge_siege_at)->toIso8601String(),
+            'prise_en_charge_siege_par_nom' => $bc->prise_en_charge_siege_par_nom,
             'note' => $bc->note,
             'lignes' => $bc->lignes->map(function (FluxBcGlobalLigne $l) use ($avecDetails) {
                 return [
@@ -605,6 +808,8 @@ class FluxCircuitController extends Controller
                     'designation' => $l->designation,
                     'categorie' => $l->categorie,
                     'quantite' => $l->quantite,
+                    'quantite_prise_siege' => (int) ($l->quantite_prise_siege ?? 0),
+                    'quantite_reliquat' => max(0, (int) $l->quantite - (int) ($l->quantite_prise_siege ?? 0)),
                     'prix_unitaire_xaf' => $l->prix_unitaire_xaf,
                     'montant_ligne_xaf' => $l->montant_ligne_xaf,
                     'details_demandeurs' => $avecDetails ? ($l->details_demandeurs ?: []) : [],

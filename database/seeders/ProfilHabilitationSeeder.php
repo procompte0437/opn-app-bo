@@ -313,11 +313,12 @@ class ProfilHabilitationSeeder extends Seeder
         if ($habilitationIds->isEmpty()) {
             return;
         }
+        // Compatible SQLite (tests) et PostgreSQL : pas de bool_and()
         $exclusifs = User::query()
             ->whereNotNull('profil_id')
             ->select('profil_id')
             ->groupBy('profil_id')
-            ->havingRaw("bool_and(code_role in ('DEMANDEUR_PHARMACIEN', 'DEMANDEUR_STRUCTURE'))")
+            ->havingRaw("SUM(CASE WHEN code_role NOT IN ('DEMANDEUR_PHARMACIEN', 'DEMANDEUR_STRUCTURE') THEN 1 ELSE 0 END) = 0")
             ->pluck('profil_id');
         $profilIds = collect(['demandeur', 'demandeur_structure'])
             ->map(fn ($code) => $ids[$code] ?? null)

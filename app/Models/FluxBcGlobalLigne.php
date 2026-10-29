@@ -15,6 +15,7 @@ class FluxBcGlobalLigne extends Model
         'designation',
         'categorie',
         'quantite',
+        'quantite_prise_siege',
         'prix_unitaire_xaf',
         'montant_ligne_xaf',
         'details_demandeurs',
