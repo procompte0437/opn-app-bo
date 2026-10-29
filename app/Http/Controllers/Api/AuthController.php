@@ -428,7 +428,8 @@ class AuthController extends Controller
 
         $profils = $users->map(function (User $user) {
             $nom = $user->name ?: ($user->email ?: 'Utilisateur');
-            $role = $user->profil?->libelle ?: ($user->role ?: 'Agent OPN');
+            // Rôle nominatif du compte (ex. province) en priorité — le libellé profil est générique.
+            $role = $user->role ?: ($user->profil?->libelle ?: 'Agent OPN');
             $codeRole = $user->code_role ?: 'DEMANDEUR_STRUCTURE';
             $provinceNom = $user->provinceRattachement?->nom
                 ?: $user->antenne?->nom
